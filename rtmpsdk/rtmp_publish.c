@@ -205,6 +205,7 @@ static void RtmpPubDestroyNalunit(RtmpPubNalUnit * _pUnit)
 
 int RtmpPubInit(RtmpPubContext * _pRtmp)
 {
+        _pRtmp->m_videoType = RTMP_PUB_VIDEOTYPE_AVC;
         if (_pRtmp->m_nAudioInputType <= RTMP_PUB_AUDIO_AAC) {
                 return 0;
         }
@@ -217,6 +218,12 @@ int RtmpPubInit(RtmpPubContext * _pRtmp)
                 return nRet;
         }
         return nRet;
+}
+
+void RtmpPubSetVideoType(RtmpPubContext * _pRtmp, RtmpPubVideoType _type)
+{
+        _pRtmp->m_videoType = _type;
+        return;
 }
 
 RtmpPubContext * RtmpPubNew(const char * _url, unsigned int _nTimeout, RtmpPubAudioType _nInputAudioType, RtmpPubAudioType _nOutputAudioType, 
@@ -382,6 +389,27 @@ static int SendVideos(RtmpPubContext * _pRtmp, const char * _pData, unsigned int
         return SendPacket(_pRtmp, RTMP_PACKET_TYPE_VIDEO, _pData, _nSize, nPacketStamp, nHeaderType, nChannel);
 }
 
+/*
+ aligned(8) class AVCDecoderConfigurationRecord {
+ unsigned int(8) configurationVersion = 1;
+ unsigned int(8) AVCProfileIndication;
+ unsigned int(8) profile_compatibility;
+ unsigned int(8) AVCLevelIndication;
+ bit(6) reserved = ‘111111’b;
+ unsigned int(2) lengthSizeMinusOne;
+ bit(3) reserved = ‘111’b;
+ unsigned int(5) numOfSequenceParameterSets;
+ for (i=0; i< numOfSequenceParameterSets; i++) {
+ unsigned int(16) sequenceParameterSetLength ;
+ bit(8*sequenceParameterSetLength) sequenceParameterSetNALUnit;
+ }
+ unsigned int(8) numOfPictureParameterSets;
+ for (i=0; i< numOfPictureParameterSets; i++) {
+ unsigned int(16) pictureParameterSetLength;
+ bit(8*pictureParameterSetLength) pictureParameterSetNALUnit;
+ }
+ }
+ */
 static int RtmpPubSendH264Config(RtmpPubContext * _pRtmp, unsigned int _nTimeStamp)
 {
         int i = 0;
@@ -430,6 +458,180 @@ static int RtmpPubSendH264Config(RtmpPubContext * _pRtmp, unsigned int _nTimeSta
         return SendVideos(_pRtmp, body, i, _nTimeStamp);
 }
 
+void bitcopy(void *dst, int nDstOffsetBit, const void *src, int nSrcOffsetBit, int nCopyBitLen)
+{
+        unsigned char * d = (unsigned char *)dst + nDstOffsetBit / 8;
+        unsigned char * s = (unsigned char *)src + nSrcOffsetBit / 8;
+        nSrcOffsetBit = nSrcOffsetBit % 8;
+        nDstOffsetBit = nDstOffsetBit % 8;
+        
+        int len = nCopyBitLen / 8;
+        int remainBit = nCopyBitLen % 8;
+        if (nDstOffsetBit == 0 && nSrcOffsetBit == 0) {
+                if (len > 0) {
+                        memcpy(dst, src, len);
+                }
+                if (remainBit > 0) {
+                        d[len] = ( (s[len] & (0xff << (8-remainBit))) | (d[len] & (0xff >> remainBit)) );
+                }
+                return;
+        }
+        
+        if (nDstOffsetBit == 0 && nSrcOffsetBit != 0) {
+                for (int i = 0; i < len; i++) {
+                        d[i] = ((s[i] & (0xff >> nSrcOffsetBit)) << nSrcOffsetBit) |
+                        ((s[i+1] & (0xff << (8 - nSrcOffsetBit))) >> (8 - nSrcOffsetBit));
+                }
+                if (remainBit > 0) {
+                        int remainAddOffsetLen = remainBit + nSrcOffsetBit;
+                        if (remainAddOffsetLen <= 8) {
+                                d[len] = ( ((s[len] & (0xff << (8-remainAddOffsetLen))) << nSrcOffsetBit) | (d[len] & (0xff >> remainBit)) );
+                        } else {
+                                //d[len] = ( ((s[len] << nSrcOffsetBit) & (0xff << nSrcOffsetBit)) |
+                                d[len] = ( (s[len] << nSrcOffsetBit) |
+                                          ((s[len+1] & (0xff << (8-(remainAddOffsetLen - 8)))) >> (8 - nSrcOffsetBit)) |
+                                          (d[len] & (0xff >> remainBit)) );
+                        }
+                }
+                return;
+        }
+        
+        if (nDstOffsetBit != 0 && nSrcOffsetBit == 0) {
+                for (int i = 0; i < len; i++) {
+                        d[i] = ((s[i] & (0xff << nDstOffsetBit)) >> nDstOffsetBit) | (d[i] & (0xff << (8 - nDstOffsetBit)));
+                        d[i+1] = ((s[i] & (0xff >> (8 - nDstOffsetBit))) << (8 - nDstOffsetBit)) | (d[i+1] & (0xff >> nDstOffsetBit));
+                }
+                if (remainBit > 0) {
+                        int remainAddOffsetLen = remainBit + nDstOffsetBit;
+                        if (remainAddOffsetLen <= 8) {
+                                d[len] = (d[len] & (0xff << (8 - nDstOffsetBit))) | //save most nDstOffsetBit bits
+                                ((s[len] & (0xff << (8 - remainBit))) >> nDstOffsetBit) |
+                                (d[len] & (0xff >> remainAddOffsetLen)); //save least (8 - remainAddOffsetLen) bits
+                        } else {
+                                d[len] = (d[len] & (0xff << (8 - nDstOffsetBit))) |
+                                ((s[len] & (0xff << nDstOffsetBit)) >> nDstOffsetBit);
+                                
+                                int bitPos = 8 - nDstOffsetBit;
+                                d[len+1] = ((s[len] & (0xff << (8 - remainBit))) << bitPos) |
+                                (d[len+1] & (0xff >> (remainAddOffsetLen - 8)));
+                                
+                        }
+                }
+                return;
+        }
+        if (nDstOffsetBit != 0 && nSrcOffsetBit != 0) {
+                return;
+        }
+}
+
+
+/*
+ unsigned int(8)  configurationVersion;
+ unsigned int(2)  general_profile_space;
+ unsigned int(1)  general_tier_flag;
+ unsigned int(5)  general_profile_idc;
+ unsigned int(32) general_profile_compatibility_flags;
+ unsigned int(48) general_constraint_indicator_flags;
+ unsigned int(8)  general_level_idc;
+ bit(4) reserved = ‘1111’b;
+ unsigned int(12) min_spatial_segmentation_idc;
+ bit(6) reserved = ‘111111’b;
+ unsigned int(2)  parallelismType;
+ bit(6) reserved = ‘111111’b;
+ unsigned int(2)  chromaFormat;
+ bit(5) reserved = ‘11111’b;
+ unsigned int(3)  bitDepthLumaMinus8;
+ bit(5) reserved = ‘11111’b;
+ unsigned int(3)  bitDepthChromaMinus8;
+ bit(16) avgFrameRate;
+ bit(2)  constantFrameRate;
+ bit(3)  numTemporalLayers;
+ bit(1)  temporalIdNested;
+ unsigned int(2) lengthSizeMinusOne;
+ unsigned int(8) numOfArrays;
+ for (j=0; j < numOfArrays; j++) {
+ bit(1) array_completeness;
+ unsigned int(1)  reserved = 0;
+ unsigned int(6)  NAL_unit_type;
+ unsigned int(16) numNalus;
+ for (i=0; i< numNalus; i++) {
+ unsigned int(16) nalUnitLength;
+ bit(8*nalUnitLength) nalUnit;
+ }
+ }
+*/
+
+static int RtmpPubSendH265Config(RtmpPubContext * _pRtmp, unsigned int _nTimeStamp)
+{
+        int i = 0;
+        char body[1024];
+        
+        // sanity check
+        if (_pRtmp->m_pPps.m_nSize == 0 || _pRtmp->m_pSps.m_nSize <  4) {
+                Debug("No pps or sps");
+                return -1;
+        }
+        
+        // header
+        body[i++] = 0x1C; // 1:keyframe  12:HEVC
+        body[i++] = 0x00; // AVC sequence header
+        
+        body[i++] = 0x00;
+        body[i++] = 0x00;
+        body[i++] = 0x00; // fill in 0;
+        
+        // HEVCDecoderConfigurationRecord.
+        body[i++] = 0x01; // configurationVersion
+        
+        bitcopy(&body[i], 0, _pRtmp->m_pVps.m_pData, 45, 96);
+        i+=(96/8);
+        
+        // FIXME: parse min_spatial_segmentation_idc.
+        body[i++] = 0xf0;
+        body[i++] = 0;
+        
+        // FIXME: derive parallelismType properly.
+        body[i++] = 0xfc;
+        //TODO parse SPS to get follow value
+        body[i++] = 0xfc | 0x01;//| chromaFormatIdc;
+        body[i++] = 0xf8 ;//| bitDepthLumaMinus8;
+        body[i++] = 0xf8 ;//| bitDepthChromaMinus8;
+        
+        // FIXME: derive avgFrameRate
+        body[i++] = 0;
+        body[i++] = 0;
+        
+        body[i++] = 3; //constantFrameRate, numTemporalLayers, temporalIdNested are set to 0 and lengthSizeMinusOne set to 3
+        
+        body[i++] = 3; //sps pps vps
+        
+        //kHevcNalUnitTypeVps = 32,
+        //kHevcNalUnitTypeSps = 33,
+        //kHevcNalUnitTypePps = 34,
+        body[i++] = 32;
+        body[i++] = _pRtmp->m_pVps.m_nSize >> 8;
+        body[i++] = _pRtmp->m_pVps.m_nSize & 0xff;
+        memcpy(&body[i], _pRtmp->m_pVps.m_pData, _pRtmp->m_pVps.m_nSize);
+        i = i + _pRtmp->m_pVps.m_nSize;
+        
+        body[i++] = 33;
+        body[i++] = _pRtmp->m_pSps.m_nSize >> 8;
+        body[i++] = _pRtmp->m_pSps.m_nSize & 0xff;
+        memcpy(&body[i], _pRtmp->m_pSps.m_pData, _pRtmp->m_pSps.m_nSize);
+        i = i + _pRtmp->m_pSps.m_nSize;
+        
+        // pps nums
+        body[i++] = 34; //&0x1f
+        body[i++] = _pRtmp->m_pPps.m_nSize>> 8;
+        body[i++] = _pRtmp->m_pPps.m_nSize& 0xff;
+        // sps data
+        memcpy(&body[i], _pRtmp->m_pPps.m_pData, _pRtmp->m_pPps.m_nSize);
+        i = i + _pRtmp->m_pPps.m_nSize;
+        
+        printf("decoder:----%d %d %d %d\n",_pRtmp->m_pVps.m_nSize, _pRtmp->m_pSps.m_nSize, _pRtmp->m_pPps.m_nSize, i);
+        return SendVideos(_pRtmp, body, i, _nTimeStamp);
+}
+
 static unsigned int WriteNalDataToBuffer(char *_pBuffer, const char *_pData, unsigned int _nLength)
 {
         int i = 0;
@@ -459,10 +661,15 @@ static int SendH264Packet(RtmpPubContext * _pRtmp, const char *_data, unsigned i
         char *body = (char *)malloc(_size + 9);
 
         int i = 0;
+        
+        int x = 0x07;
+        if (_pRtmp->m_videoType == RTMP_PUB_VIDEOTYPE_HEVC) {
+                x = 0x0c;
+        }
         if (_bIsKeyFrame) {
-                body[i++] = 0x17; // 1:Iframe 7:AVC
+                body[i++] = 0x10 | x; // 1:Iframe 7:AVC c:hevc
         } else {
-                body[i++] = 0x27; // 2:Pframe 7:AVC
+                body[i++] = 0x20 | x; // 2:Pframe 7:AVC c:hevc
         }
         body[i++] = 0x01; // AVC NALU
 
@@ -500,19 +707,22 @@ static int RtmpPubSendH264Keyframe(RtmpPubContext * _pRtmp, const char * _pData,
         if (_nSize < 11) {
                 return -1;
         }
-
         // this is a bit different, the body consists of [header][nalu_size][nalu][nalu_size][nalu][...] 
-        int nNalUnitNum = 2 + (_pRtmp->m_pSei.m_nSize > 0 ? 1 : 0) + 1; // SPS+PPS + SEI + IDR
-        int nDataSize = _pRtmp->m_pSps.m_nSize + _pRtmp->m_pPps.m_nSize + _pRtmp->m_pSei.m_nSize +  _nSize + 5 + nNalUnitNum * 4;
+        int nNalUnitNum = (_pRtmp->m_pVps.m_nSize > 0 ? 1 : 0) + 2 + (_pRtmp->m_pSei.m_nSize > 0 ? 1 : 0) + 1; // VPS+SPS+PPS + [SEI] + IDR
+        int nDataSize = _pRtmp->m_pVps.m_nSize + _pRtmp->m_pSps.m_nSize + _pRtmp->m_pPps.m_nSize + _pRtmp->m_pSei.m_nSize +  _nSize + 5 + nNalUnitNum * 4;
         char *body = (char *)malloc(nDataSize);
         int i = 0;
         int bRet;
 
         //
-        // header (5bytes)
+        // header (5bytes)， included in nDataSize
         //
         
-        body[i++] = 0x17; // 1:Iframe 7:AVC
+        body[i] = 0x17; // 1:Iframe 7:AVC
+        if (_pRtmp->m_videoType == RTMP_PUB_VIDEOTYPE_HEVC) {
+                 body[i] = 0x1c; // 1:Iframe c:hevc
+        }
+        i++;
         body[i++] = 0x01; // AVC NALU
 
         // composition time adjustment
@@ -525,6 +735,10 @@ static int RtmpPubSendH264Keyframe(RtmpPubContext * _pRtmp, const char * _pData,
         //
 
         unsigned int nBytes;
+        if (_pRtmp->m_pVps.m_nSize != 0) {
+                nBytes = WriteNalUnitToBuffer(&body[i], &_pRtmp->m_pVps);
+                i += nBytes;
+        }
 
         // SPS & PPS
         nBytes = WriteNalUnitToBuffer(&body[i], &_pRtmp->m_pSps);
@@ -540,7 +754,7 @@ static int RtmpPubSendH264Keyframe(RtmpPubContext * _pRtmp, const char * _pData,
                 nBytes = WriteNalUnitToBuffer(&body[i], &_pRtmp->m_pSei);
                 i += nBytes;
         }
-
+        
         // IDR
         WriteNalDataToBuffer(&body[i], _pData, _nSize);
 
@@ -569,6 +783,14 @@ void RtmpPubSetSps(RtmpPubContext * _pRtmp, const char * _pData, unsigned int _n
                 return;
         };
         RtmpPubFillNalunit(&_pRtmp->m_pSps, _pData, _nSize);
+}
+
+void RtmpPubSetVps(RtmpPubContext * _pRtmp, const char * _pData, unsigned int _nSize)
+{
+        if (_pRtmp == NULL || _pData == NULL || _nSize == 0) {
+                return;
+        };
+        RtmpPubFillNalunit(&_pRtmp->m_pVps, _pData, _nSize);
 }
 
 void RtmpPubSetSei(RtmpPubContext * _pRtmp, const char * _pData, unsigned int _nSize)
@@ -968,8 +1190,13 @@ int RtmpPubSendVideoKeyframe(RtmpPubContext * _pRtmp, const char * _pData, unsig
 {
         int ret = 0;
         if (_pRtmp->m_nIsVideoConfigSent == 0) {
-                ret = RtmpPubSendH264Config(_pRtmp, _presentationTime);
+                if (_pRtmp->m_videoType == RTMP_PUB_VIDEOTYPE_AVC) {
+                        ret = RtmpPubSendH264Config(_pRtmp, _presentationTime);
+                } else {
+                        ret = RtmpPubSendH265Config(_pRtmp, _presentationTime);
+                }
                 if (ret < 0) {
+                        printf("RtmpPubSend video Config fail\n");
                         return ret;
                 }
                 _pRtmp->m_nIsVideoConfigSent = 1;
@@ -977,6 +1204,7 @@ int RtmpPubSendVideoKeyframe(RtmpPubContext * _pRtmp, const char * _pData, unsig
         
         ret = RtmpPubSendH264Keyframe(_pRtmp, _pData, _nSize, _presentationTime, 0); 
         if (ret < 0) {
+                printf("RtmpPubSendH264Keyframe fail\n");
                 return ret;
         }
         return 0;
