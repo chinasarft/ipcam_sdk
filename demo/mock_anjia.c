@@ -465,7 +465,8 @@ int dev_sdk_init(DevSdkServerType type)
                 cameras[i].videoStreams[1].nStreamNo = 1;
                 cameras[i].audioStreams[0].isAac = 1;
                 cameras[i].audioStreams[1].isAac = 1;
-                //cameras[i].audioStreams[1].IsTestAACWithoutAdts = 1;
+                cameras[i].audioStreams[0].IsTestAACWithoutAdts = 1;
+                cameras[i].audioStreams[1].IsTestAACWithoutAdts = 1;
                 //TODO default file
                 strcpy(cameras[i].audioStreams[0].file, "1_16000_a.aac");
                 strcpy(cameras[i].audioStreams[1].file, "1_16000_a.aac");
