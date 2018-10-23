@@ -120,7 +120,11 @@ static void setVideoParameters(RtmpPubContext *pRtmpc, Nalu *pNalu) {
                                 break;
                         case 34: //pps
                                 printf("set h265 pps\n");
-                               RtmpPubSetPps(pRtmpc, pNalu->data, pNalu->size);
+                                RtmpPubSetPps(pRtmpc, pNalu->data, pNalu->size);
+                                break;
+                        case 39: //SEI_PREFIX
+                                printf("set h265 sei prefix\n");
+                                RtmpPubSetSei(pRtmpc, pNalu->data, pNalu->size);
                                 break;
                         default:
                                 break;
@@ -128,6 +132,10 @@ static void setVideoParameters(RtmpPubContext *pRtmpc, Nalu *pNalu) {
         } else {
                 type = pNalu->data[0] & 0x1F;
                 switch (type) {
+                        case 6: //sei
+                                printf("set h264 sei\n");
+                                RtmpPubSetSei(pRtmpc, pNalu->data, pNalu->size);
+                                break;
                         case 7: //sps
                                 printf("set h264 sps\n");
                                 RtmpPubSetSps(pRtmpc, pNalu->data, pNalu->size);
@@ -213,7 +221,7 @@ static int isVideoFrameData(Nalu *pNalu) {
 }
 
 static char h264Aud3[3]={0, 0, 1};
-static char h264Aud4[3]={0, 0, 0, 1};
+static char h264Aud4[4]={0, 0, 0, 1};
 static int RtmpH264Send(IN char *_pData, IN int _nLen, IN double _dTimeStamp, IN int _nIskey)
 {
         RtmpPubContext *pRtmpc = gAppContext.pRtmpc;
@@ -237,59 +245,36 @@ static int RtmpH264Send(IN char *_pData, IN int _nLen, IN double _dTimeStamp, IN
         pthread_mutex_lock(&gAppContext.pushLock);
         if (gAppContext.status == RTMP_START) {
                 
-                if (_nIskey && gAppContext.videoState == QN_FALSE) {
-                        fprintf(stderr, "first set video config:%d\n", _nLen);
+                if (_nIskey ) {
+                        if (gAppContext.videoState == QN_FALSE) {
+                                fprintf(stderr, "first set video config:%d\n", _nLen);
+                        }
+                        
                         int nSepLen;
-                        RtmpPubSetVideoTimebase(pRtmpc, presentationTime);
-                        pNalu = ParseNalu(_pData, _nLen, &nalu, &nSepLen);
-                        if (!pNalu) {
-                                goto RTMPH264SEND_UNLOCK;
-                        }
-                        fprintf(stderr, "meta1:%d\n", pNalu->size + nSepLen);
-                        setVideoParameters(pRtmpc, pNalu);
-                        //RtmpPubSetSps(pRtmpc, pNalu->data, pNalu->size);
-                        nIdx += pNalu->size + nSepLen;
-
-                        pNalu = ParseNalu(_pData + nIdx, _nLen - nIdx, &nalu, &nSepLen );
-                        if (!pNalu) {
-                                goto RTMPH264SEND_UNLOCK;
-                        }
-                        fprintf(stderr, "meta2:%d\n", pNalu->size + nSepLen);
-                        setVideoParameters(pRtmpc, pNalu);
-                        //RtmpPubSetPps(pRtmpc, pNalu->data, pNalu->size);
-                        nIdx += pNalu->size + nSepLen;
-                        
-                        if (gAppContext.videoType == RTMP_PUB_VIDEOTYPE_HEVC) {
-                                pNalu = ParseNalu(_pData + nIdx, _nLen - nIdx, &nalu, &nSepLen );
-                                if (!pNalu) {
-                                        goto RTMPH264SEND_UNLOCK;
-                                }
-                                fprintf(stderr, "meta3:%d\n", pNalu->size + nSepLen);
-                                setVideoParameters(pRtmpc, pNalu);
-                                //RtmpPubSetPps(pRtmpc, pNalu->data, pNalu->size);
-                                nIdx += pNalu->size + nSepLen;
-                        }
-                        
                         while(1) {
                                 pNalu = ParseNalu(_pData + nIdx, _nLen - nIdx, &nalu, &nSepLen );
                                 if (!pNalu) {
                                         goto RTMPH264SEND_UNLOCK;
                                 }
                                 nIdx += pNalu->size + nSepLen;
-                                fprintf(stderr, "metax:%d\n", pNalu->size + nSepLen);
+                                
                                 if (isVideoFrameData(pNalu)) {
                                         fprintf(stderr, "key:%d %d\n", pNalu->size, nSepLen);
                                         _pData = pNalu->data;
                                         _nLen = pNalu->size;
                                         break;
+                                } else {
+                                        if (gAppContext.videoState == QN_FALSE) {
+                                                fprintf(stderr, "meta:%d %02x \n", pNalu->size + nSepLen, (uint8_t)pNalu->data[nSepLen]);
+                                                setVideoParameters(pRtmpc, pNalu);
+                                        }
                                 }
                                 
                         }
-
-                        gAppContext.videoState = QN_TRUE;
-                        gAppContext.isOk = QN_TRUE;
-                        
-                        
+                        if (gAppContext.videoState == QN_FALSE) {
+                                gAppContext.videoState = QN_TRUE;
+                                gAppContext.isOk = QN_TRUE;
+                        }
                 }
 
                 if (false == RtmpIsConnected(gAppContext.pRtmpc)) {
@@ -298,15 +283,16 @@ static int RtmpH264Send(IN char *_pData, IN int _nLen, IN double _dTimeStamp, IN
                 }
 
                 if (_nIskey) {
-                        if (RtmpPubSendVideoKeyframe(pRtmpc, _pData, _nLen, presentationTime) != QN_SUCCESS) {
+                        if (RtmpPubSendVideoKeyframe(pRtmpc, pNalu->data, pNalu->size, presentationTime) != QN_SUCCESS) {
                                 QnDemoPrint(DEMO_ERR, "Send video key frame fail, reInit Rtmp.\n");
                                 goto REINIT_RTMP;
                         }
                 }
                 else {
-                        if (memcmp(_pData, h264Aud3, 3) == 0) {
+                        if (memcmp(h264Aud3, _pData, 3) == 0) {
                                 _pData += 3;
                                 _nLen -= 3;
+                                
                         } else {
                                 _pData += 4;
                                 _nLen -= 4;

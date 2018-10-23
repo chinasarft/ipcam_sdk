@@ -8,6 +8,8 @@
 #include "qnRtmp.h"
 #include "devsdk.h"
 
+//#define DEFAULT_H265 1
+
 int main(int argc, char **argv)
 {
         int sig;
@@ -20,7 +22,6 @@ int main(int argc, char **argv)
         pthread_sigmask(SIG_BLOCK, &set, NULL);
 
        
-
         if (argc >= 2) {
                 if (argc >= 3) {
                         //init cam
@@ -34,9 +35,15 @@ int main(int argc, char **argv)
                         RtmpInit(argv[1], "h264");
                 }
         } else {
-                //RtmpInit("rtmp://localhost/live/test1", "h264");
+#ifdef DEFAULT_H265
+                dev_sdk_init(DEV_SDK_PROCESS_APP);
+                printf("2push 265\n");
+                RtmpInit("rtmp://pili-publish.caster.test.cloudvdn.com/caster-test/test12", "h265");
+#else
+                dev_sdk_init(0);
                 printf("2push 264\n");
                 RtmpInit("rtmp://pili-publish.caster.test.cloudvdn.com/caster-test/test12", "h264");
+#endif
         }
 
         //start a/v callback

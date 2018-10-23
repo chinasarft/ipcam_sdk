@@ -593,7 +593,7 @@ static int RtmpPubSendH265Config(RtmpPubContext * _pRtmp, unsigned int _nTimeSta
         // FIXME: derive parallelismType properly.
         body[i++] = 0xfc;
         //TODO parse SPS to get follow value
-        body[i++] = 0xfc | 0x01;//| chromaFormatIdc;
+        body[i++] = 0xfc | 0x01;//| chromaFormatIdc; 1表示yuv420
         body[i++] = 0xf8 ;//| bitDepthLumaMinus8;
         body[i++] = 0xf8 ;//| bitDepthChromaMinus8;
         
