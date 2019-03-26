@@ -6,14 +6,14 @@
 #include "rtmp_sys.h"
 
 
-#define xDEBUG
+#define DEBUG
 
 #ifndef DEBUG
 #define Debug(fmt, arg...)
 
 #else
 #define Debug(fmt, arg...) do {\
-                                        printf( "file:%s, line:%d->" fmt "\n",  __FILE__, __LINE__, ##arg);\
+                                        fprintf(stderr, "file:%s, line:%d->" fmt "\n",  __FILE__, __LINE__, ##arg);\
                                 } while(0)
 #endif
 
@@ -184,6 +184,73 @@ typedef struct _AdtsHeader
         unsigned int nNoRawDataBlocksInFrame;
 } AdtsHeader;
 
+static const uint8_t *ff_avc_find_startcode_internal(const uint8_t *p, const uint8_t *end)
+{
+        const uint8_t *a = p + 4 - ((intptr_t)p & 3);
+        
+        for (end -= 3; p < a && p < end; p++) {
+                if (p[0] == 0 && p[1] == 0 && p[2] == 1)
+                        return p;
+        }
+        
+        for (end -= 3; p < end; p += 4) {
+                uint32_t x = *(const uint32_t*)p;
+                //      if ((x - 0x01000100) & (~x) & 0x80008000) // little endian
+                //      if ((x - 0x00010001) & (~x) & 0x00800080) // big endian
+                if ((x - 0x01010101) & (~x) & 0x80808080) { // generic
+                        if (p[1] == 0) {
+                                if (p[0] == 0 && p[2] == 1)
+                                        return p;
+                                if (p[2] == 0 && p[3] == 1)
+                                        return p+1;
+                        }
+                        if (p[3] == 0) {
+                                if (p[2] == 0 && p[4] == 1)
+                                        return p+2;
+                                if (p[4] == 0 && p[5] == 1)
+                                        return p+3;
+                        }
+                }
+        }
+        
+        for (end += 3; p < end; p++) {
+                if (p[0] == 0 && p[1] == 0 && p[2] == 1)
+                        return p;
+        }
+        
+        return end + 3;
+}
+
+static const uint8_t *ff_avc_find_startcode(const uint8_t *p, const uint8_t *end){
+        const uint8_t *out= ff_avc_find_startcode_internal(p, end);
+        if(p<out && out<end && !out[-1]) out--;
+        return out;
+}
+
+static RtmpPubNalUnit* parse_nalu(const char *_pStart, int _nLen, RtmpPubNalUnit *pNalu, int *_pSepLen)
+{
+        const uint8_t *endptr = (const uint8_t *)(_pStart + _nLen);
+        const uint8_t * pStart = (uint8_t *)ff_avc_find_startcode((const uint8_t *)_pStart, endptr);
+        if (pStart == NULL)
+                return NULL;
+        uint8_t * pEnd = (uint8_t *)ff_avc_find_startcode(pStart+4, endptr);
+        if (pEnd == NULL)
+                return NULL;
+        
+        char sep[3] = {0x00, 0x00, 0x01};
+        if ( memcmp(pStart, sep, 3) == 0) {
+                *_pSepLen = 3;
+                pNalu->m_pData = (char *)(pStart + 3);
+                pNalu->m_nSize = (int)(pEnd - pStart) - 3;
+        } else {
+                *_pSepLen = 4;
+                pNalu->m_pData = (char *)(pStart + 4);
+                pNalu->m_nSize = (int)(pEnd - pStart) - 4;
+        }
+        
+        return pNalu;
+}
+
 static void RtmpPubFillNalunit(RtmpPubNalUnit * _pUnit, const char * _pData, unsigned int _nSize)
 {
         if (_pUnit->m_pData) {
@@ -205,6 +272,13 @@ static void RtmpPubDestroyNalunit(RtmpPubNalUnit * _pUnit)
 
 int RtmpPubInit(RtmpPubContext * _pRtmp)
 {
+        memset(&_pRtmp->m_mutex, 0, sizeof(pthread_mutex_t));
+        int nRet = pthread_mutex_init(&_pRtmp->m_mutex, NULL);
+        if (nRet != 0) {
+                Debug("pthread_mutex_init fail:%s", strerror(errno));
+                return nRet;
+        }
+        
         _pRtmp->m_videoType = RTMP_PUB_VIDEOTYPE_AVC;
         if (_pRtmp->m_nAudioInputType <= RTMP_PUB_AUDIO_AAC) {
                 return 0;
@@ -212,17 +286,27 @@ int RtmpPubInit(RtmpPubContext * _pRtmp)
         if (_pRtmp->m_nAudioOutputType != RTMP_PUB_AUDIO_AAC) {
                 return 0;
         }
-        int nRet = AacEncoderInit(_pRtmp->m_pAudioEncoderContext);
+        
+        nRet = AacEncoderInit(_pRtmp->m_pAudioEncoderContext);
         if (nRet < 0) {
+                pthread_mutex_destroy(&_pRtmp->m_mutex);
+                memset(&_pRtmp->m_mutex, 0, sizeof(pthread_mutex_t));
                 Debug("AacEncoderInit");
                 return nRet;
         }
+        
         return nRet;
 }
 
 void RtmpPubSetVideoType(RtmpPubContext * _pRtmp, RtmpPubVideoType _type)
 {
         _pRtmp->m_videoType = _type;
+        return;
+}
+
+void RtmpPubSetAudioConfig(RtmpPubContext * _pRtmp, int nSampleRate, int nChannels) {
+        _pRtmp->m_nAudioSampleRate = nSampleRate;
+        _pRtmp->m_nAudioChannel = nChannels;
         return;
 }
 
@@ -301,7 +385,7 @@ void RtmpPubDel(RtmpPubContext * _pRtmp)
                 RTMP_Free(_pRtmp->m_pRtmp);
                 _pRtmp->m_pRtmp = NULL;
         }
-
+        pthread_mutex_destroy(&_pRtmp->m_mutex);
         free(_pRtmp);
 }
 
@@ -310,6 +394,7 @@ int RtmpPubConnect(RtmpPubContext * _pRtmp)
         if (_pRtmp == NULL) {
                 return -1;
         }
+        signal(SIGPIPE, SIG_IGN);
         struct RTMP * m_pRtmp = _pRtmp->m_pRtmp;
 
         m_pRtmp->Link.timeout = _pRtmp->m_nTimeout;
@@ -365,13 +450,12 @@ static int SendAudios(RtmpPubContext * _pRtmp, const char * _pData, unsigned int
         unsigned int nPacketStamp = 0;
         unsigned char nHeaderType = 0;
         unsigned char nChannel = 0;
-        
         if (_pRtmp->m_nTimePolicy == RTMP_PUB_TIMESTAMP_ABSOLUTE) {
                 GetAudioInfoAbs(_pRtmp, _nTimeStamp, &nPacketStamp, &nHeaderType, &nChannel);
         } else {
                 GetInfoRelative(_pRtmp, _nTimeStamp, &nPacketStamp, &nHeaderType, &nChannel);
         }
-        Debug("Audio Frame send- timestamp:%u, headertype:%d channel:%d", nPacketStamp, nHeaderType, nChannel);
+        Debug("Audio Frame send- timestamp:%u, headertype:%d channel:%d len:%d", nPacketStamp, nHeaderType, nChannel, _nSize);
         return SendPacket(_pRtmp, RTMP_PACKET_TYPE_AUDIO, _pData, _nSize, nPacketStamp, nHeaderType, nChannel);
 }
 
@@ -385,7 +469,7 @@ static int SendVideos(RtmpPubContext * _pRtmp, const char * _pData, unsigned int
         } else {
                 GetInfoRelative(_pRtmp, _nTimeStamp, &nPacketStamp, &nHeaderType, &nChannel);
         }
-        Debug("Video Frame send- timestamp:%u, headertype:%d channel:%d", nPacketStamp, nHeaderType, nChannel);
+        Debug("Video Frame send- timestamp:%u, headertype:%d channel:%d len:%d", nPacketStamp, nHeaderType, nChannel, _nSize);
         return SendPacket(_pRtmp, RTMP_PACKET_TYPE_VIDEO, _pData, _nSize, nPacketStamp, nHeaderType, nChannel);
 }
 
@@ -410,15 +494,49 @@ static int SendVideos(RtmpPubContext * _pRtmp, const char * _pData, unsigned int
  }
  }
  */
-static int RtmpPubSendH264Config(RtmpPubContext * _pRtmp, unsigned int _nTimeStamp)
+static int RtmpPubSendH264Config(RtmpPubContext * _pRtmp, unsigned int _nTimeStamp, const char * _pData, unsigned int _nLen)
 {
         int i = 0;
         char body[1024];
 
         // sanity check
         if (_pRtmp->m_pPps.m_nSize == 0 || _pRtmp->m_pSps.m_nSize <  4) {
-                Debug("No pps or sps");
-                return -1;
+                RtmpPubNalUnit *pNalu = NULL;
+                RtmpPubNalUnit nalu;
+                int nIdx = 0;
+                int nSepLen;
+                uint8_t shouldBreak = 0, spsset = 0, ppsset = 0, seiset = 0;
+                while(shouldBreak == 0) {
+                        pNalu = parse_nalu(_pData + nIdx, _nLen - nIdx, &nalu, &nSepLen );
+                        if (!pNalu) {
+                                break;
+                        }
+                        nIdx = nIdx + nSepLen + pNalu->m_nSize;
+                        pNalu->m_nType = pNalu->m_pData[0] & 0x1F;
+                        switch ( pNalu->m_nType) {
+                                case 6: //sei
+                                        seiset = 1;
+                                        Debug("set h264 sei\n");
+                                        RtmpPubSetSei(_pRtmp, pNalu->m_pData, pNalu->m_nSize);
+                                        break;
+                                case 7: //sps
+                                        spsset = 1;
+                                        Debug("set h264 sps\n");
+                                        RtmpPubSetSps(_pRtmp, pNalu->m_pData, pNalu->m_nSize);
+                                        break;
+                                case 8: //pps
+                                        ppsset = 1;
+                                        Debug("set h264 pps\n");
+                                        RtmpPubSetPps(_pRtmp, pNalu->m_pData, pNalu->m_nSize);
+                                        break;
+                                default:
+                                        shouldBreak = 1;
+                                        break;
+                        }
+                }
+                if (spsset != 1 || ppsset != 1) {
+                        return -1;
+                }
         }
 
         // header
@@ -495,15 +613,54 @@ static int RtmpPubSendH264Config(RtmpPubContext * _pRtmp, unsigned int _nTimeSta
  }
 */
 
-static int RtmpPubSendH265Config(RtmpPubContext * _pRtmp, unsigned int _nTimeStamp)
+static int RtmpPubSendH265Config(RtmpPubContext * _pRtmp, unsigned int _nTimeStamp, const char * _pData, unsigned int _nLen)
 {
         int i = 0;
         char body[1024];
         
         // sanity check
         if (_pRtmp->m_pPps.m_nSize == 0 || _pRtmp->m_pSps.m_nSize <  4) {
-                Debug("No pps or sps");
-                return -1;
+                RtmpPubNalUnit *pNalu = NULL;
+                RtmpPubNalUnit nalu;
+                int nIdx = 0;
+                int nSepLen;
+                uint8_t shouldBreak = 0, spsset = 0, ppsset = 0, seiset = 0, vpsset = 0;
+                while(shouldBreak == 0) {
+                        pNalu = parse_nalu(_pData + nIdx, _nLen - nIdx, &nalu, &nSepLen );
+                        if (!pNalu) {
+                                break;
+                        }
+                        nIdx = nIdx + nSepLen + pNalu->m_nSize;
+                        pNalu->m_nType = (pNalu->m_pData[0] & 0x7E)>>1;
+                        switch ( pNalu->m_nType) {
+                                case 32: //vps
+                                        vpsset = 1;
+                                        Debug("set h265 vps\n");
+                                        RtmpPubSetVps(_pRtmp, pNalu->m_pData, pNalu->m_nSize);
+                                        break;
+                                case 33: //sps
+                                        spsset = 1;
+                                        Debug("set h265 sps\n");
+                                        RtmpPubSetSps(_pRtmp, pNalu->m_pData, pNalu->m_nSize);
+                                        break;
+                                case 34: //pps
+                                        ppsset = 1;
+                                        Debug("set h265 pps\n");
+                                        RtmpPubSetPps(_pRtmp, pNalu->m_pData, pNalu->m_nSize);
+                                        break;
+                                case 39: //SEI_PREFIX
+                                        seiset = 1;
+                                        Debug("set h265 sei prefix\n");
+                                        RtmpPubSetSei(_pRtmp, pNalu->m_pData, pNalu->m_nSize);
+                                        break;
+                                default:
+                                        shouldBreak = 1;
+                                        break;
+                        }
+                }
+                if (spsset != 1 || ppsset != 1 || vpsset != 1) {
+                        return -1;
+                }
         }
         
         // header
@@ -595,6 +752,7 @@ static unsigned int WriteNalUnitToBuffer(char *_pBuffer, RtmpPubNalUnit *_pNalu)
 static int SendH264Packet(RtmpPubContext * _pRtmp, const char *_data, unsigned int _size, int _bIsKeyFrame, unsigned int _nTimeStamp, unsigned int _nCompositionTime)
 {
         if (_data == NULL && _size < 11) {
+                Debug("wrong data:%p %d", _data, _size);
                 return -1;
         }
 
@@ -632,7 +790,7 @@ static int SendH264Packet(RtmpPubContext * _pRtmp, const char *_data, unsigned i
         return bRet;
 }
 
-static int RtmpPubSendH264Keyframe(RtmpPubContext * _pRtmp, const char * _pData, unsigned int _nSize, unsigned int _presentationTime, unsigned int _nCompositionTime)
+static int rtmpPubSendVideoKeyframe(RtmpPubContext * _pRtmp, const char * _pData, unsigned int _nSize, unsigned int _presentationTime, unsigned int _nCompositionTime)
 {
         if (_pRtmp == NULL || _pData == NULL) {
                 Debug("Fatal");
@@ -704,9 +862,23 @@ static int RtmpPubSendH264Keyframe(RtmpPubContext * _pRtmp, const char * _pData,
         return bRet;
 }
 
+static char h264Aud3[3]={0, 0, 1};
+static char h264Aud4[4]={0, 0, 0, 1};
 int RtmpPubSendVideoInterframe(RtmpPubContext * _pRtmp, const char * _pData, unsigned int _nSize, unsigned int _presentationTime) 
 {
-        return SendH264Packet(_pRtmp, _pData, _nSize, 0, _presentationTime, 0);
+        pthread_mutex_lock(&_pRtmp->m_mutex);
+        if (memcmp(h264Aud3, _pData, 3) == 0) {
+                _pData += 3;
+                _nSize -= 3;
+                
+        } else if (memcmp(h264Aud4, _pData, 4) == 0) {
+                _pData += 4;
+                _nSize -= 4;
+        }
+        
+        int ret = SendH264Packet(_pRtmp, _pData, _nSize, 0, _presentationTime, 0);
+        pthread_mutex_unlock(&_pRtmp->m_mutex);
+        return ret;
 }
 
 void RtmpPubSetPps(RtmpPubContext * _pRtmp, const char * _pData, unsigned int _nSize)
@@ -814,11 +986,46 @@ static int RtmpPubSendAacFrame(RtmpPubContext * _pRtmp, const char * _pData, uns
         return SendAacFrame(_pRtmp, _nTimeStamp, _pData, _nSize);
 }
 
+static int aacfreq[13] = {96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350};
+static int findFrequencyIndex(int freq) {
+        int i = 0;
+        for (i = 0; i < 13; i++) {
+                if (aacfreq[i] == freq)
+                        return i;
+        }
+        return -1;
+}
+
+static int setAudioConfig(RtmpPubContext * _pRtmp)
+{
+        unsigned char c[2] = {0, 0};
+        int idx = findFrequencyIndex(_pRtmp->m_nAudioSampleRate);
+        if (idx < 0) {
+                Debug("wrong audio samplerate:%d\n", _pRtmp->m_nAudioSampleRate);
+                return -1;
+        }
+        c[0] |= 0x10;
+        c[0] |= (idx>>1);
+        c[1] |= (idx<<7);
+        if (1 == _pRtmp->m_nAudioChannel) {
+                c[1] |= 0x08;;
+        } else {
+                c[1] |= 0x01;;
+        }
+        
+        RtmpPubSetAac(_pRtmp, (const char *)c, 2);
+        return 0;
+}
+
 static int RtmpPubSendRawAac(RtmpPubContext * _pRtmp, const char * _pData, unsigned int _nSize, unsigned int _nTimeStamp)
 {
         int nRet = 0;
         if (_pRtmp->m_nIsAudioConfigSent == 0) {
+                if (setAudioConfig(_pRtmp) != 0) {
+                        return -2;
+                }
                 if (_pRtmp->m_aac.m_nSize == 0) {
+                        Debug("not set audio config");
                         return -1;
                 }
                 nRet = SendAacConfigRecord(_pRtmp, _pRtmp->m_aac.m_pData, _pRtmp->m_aac.m_nSize, _nTimeStamp);
@@ -833,6 +1040,7 @@ static int RtmpPubSendRawAac(RtmpPubContext * _pRtmp, const char * _pData, unsig
 
 int RtmpPubSendAudioFrame(RtmpPubContext * _pRtmp, const char * _pData, unsigned int _nSize, int _nTimeStamp)
 {
+        pthread_mutex_lock(&_pRtmp->m_mutex);
         int nRet = 0;
         switch (_pRtmp->m_nAudioInputType) {
         case RTMP_PUB_AUDIO_AAC:
@@ -848,8 +1056,11 @@ int RtmpPubSendAudioFrame(RtmpPubContext * _pRtmp, const char * _pData, unsigned
                 nRet = RtmpPubSendPcmFrame(_pRtmp, _pData, _nSize, _nTimeStamp);
                 break;
         default:
-                return -1;
+                Debug("no such audio format\n");
+                nRet = -1;
+                break;
         }
+        pthread_mutex_unlock(&_pRtmp->m_mutex);
         return nRet;
 }
 
@@ -1029,7 +1240,7 @@ static int RtmpPubSendPcmFrame(RtmpPubContext * _pRtmp, const char * _pData, uns
 static void GetInfoRelative(RtmpPubContext * _pRtmp, unsigned int _nTimeStamp, unsigned int * _nResTimeStamp, unsigned char * _nResPacketType, unsigned char * _nChannel)
 {
         if (_nTimeStamp < _pRtmp->m_nLastMediaTimeStamp) {
-                Debug("TimeStamp reverse");
+                Debug("TimeStamp reverse: current:%u last:%lld", _nTimeStamp, _pRtmp->m_nLastMediaTimeStamp);
                 //Time reverse resend an absolute packet
                 _nTimeStamp = _pRtmp->m_nLastMediaTimeStamp;
                 _pRtmp->m_bIsMediaPktSmall = 0;
@@ -1125,28 +1336,71 @@ static int RtmpPubTransferPacket(RtmpPubContext * _pRtmp, unsigned int _nPacketT
         return 0;
 }
 
+static int isVideoFrameData(const char * _pData, RtmpPubVideoType _videoType) {
+        int type = 0;
+        if (_videoType == RTMP_PUB_VIDEOTYPE_HEVC) {
+                
+                type = (_pData[0] & 0x7E)>>1;
+                switch (type) {
+                        case HEVC_NAL_IDR_W_RADL:
+                        case HEVC_NAL_CRA_NUT:
+                        case HEVC_NAL_TRAIL_N:
+                        case HEVC_NAL_TRAIL_R:
+                        case HEVC_NAL_RASL_N:
+                        case HEVC_NAL_RASL_R:
+                                return 1;
+                                
+                }
+        } else {
+                type = _pData[0] & 0x1F;
+                switch (type) {
+                        case 1:
+                        case 5:
+                                return 1;
+                }
+        }
+        return 0;
+}
 
 int RtmpPubSendVideoKeyframe(RtmpPubContext * _pRtmp, const char * _pData, unsigned int _nSize, unsigned int _presentationTime)
 {
+        pthread_mutex_lock(&_pRtmp->m_mutex);
         int ret = 0;
         if (_pRtmp->m_nIsVideoConfigSent == 0) {
                 if (_pRtmp->m_videoType == RTMP_PUB_VIDEOTYPE_AVC) {
-                        ret = RtmpPubSendH264Config(_pRtmp, _presentationTime);
+                        ret = RtmpPubSendH264Config(_pRtmp, _presentationTime, _pData, _nSize);
                 } else {
-                        ret = RtmpPubSendH265Config(_pRtmp, _presentationTime);
+                        ret = RtmpPubSendH265Config(_pRtmp, _presentationTime, _pData, _nSize);
                 }
                 if (ret < 0) {
+                        pthread_mutex_unlock(&_pRtmp->m_mutex);
                         printf("RtmpPubSend video Config fail\n");
                         return ret;
                 }
                 _pRtmp->m_nIsVideoConfigSent = 1;
         }
-        
-        ret = RtmpPubSendH264Keyframe(_pRtmp, _pData, _nSize, _presentationTime, 0); 
+        const char *pData = _pData;
+        unsigned int nSize = 0;
+        RtmpPubNalUnit *pNalu = NULL;
+        RtmpPubNalUnit nalu;
+        int nIdx = 0;
+        do  {
+                int nSepLen;
+                pNalu = parse_nalu(_pData + nIdx, _nSize - nIdx, &nalu, &nSepLen );
+                if (!pNalu) {
+                        pthread_mutex_unlock(&_pRtmp->m_mutex);
+                        Debug("wrong video keyframe data");
+                        return -2;
+                }
+                pData = pNalu->m_pData;
+                nSize = pNalu->m_nSize;
+                nIdx = nIdx + nSepLen + pNalu->m_nSize;
+        }while(!isVideoFrameData(pNalu->m_pData, _pRtmp->m_videoType));
+        ret = rtmpPubSendVideoKeyframe(_pRtmp, pData, nSize, _presentationTime, 0);
         if (ret < 0) {
-                printf("RtmpPubSendH264Keyframe fail\n");
-                return ret;
+                Debug("rtmpPubSendVideoKeyframe fail:%d", ret);
         }
-        return 0;
+        pthread_mutex_unlock(&_pRtmp->m_mutex);
+        return ret;
         
 }
