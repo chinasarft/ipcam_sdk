@@ -1186,7 +1186,7 @@ static int RtmpPubSendDecodeFrame(RtmpPubContext * _pRtmp, RtmpPubAudioType _nIn
                 return -1;
         }
         if (_pRtmp->m_pAudioEncoderContext == NULL) {
-                Debug("fail");
+                Debug("audio decode context is null");
                 return -1;
         }
         char * pAacBuffer = (char *)malloc(_nSize * 2 + 10240);
@@ -1194,7 +1194,7 @@ static int RtmpPubSendDecodeFrame(RtmpPubContext * _pRtmp, RtmpPubAudioType _nIn
         
         int nRet = _pProc(_pRtmp->m_pAudioEncoderContext, pAacBuffer, &nAacSize, _pData, _nSize);
         if (nRet < 0) {
-                Debug("fail");
+                Debug("audio decode fail");
                 free(pAacBuffer);
                 return nRet;
         }
@@ -1330,7 +1330,7 @@ static int RtmpPubTransferPacket(RtmpPubContext * _pRtmp, unsigned int _nPacketT
         case RTMP_PACKET_TYPE_VIDEO:
                 return SendVideos(_pRtmp, _pRtmpData, _nSize, _nTimeStamp); 
         default:
-                Debug("Error");
+                Debug("not audio or video packet");
                 return -1;
         }
         return 0;
@@ -1374,7 +1374,7 @@ int RtmpPubSendVideoKeyframe(RtmpPubContext * _pRtmp, const char * _pData, unsig
                 }
                 if (ret < 0) {
                         pthread_mutex_unlock(&_pRtmp->m_mutex);
-                        printf("RtmpPubSend video Config fail\n");
+                        Debug("RtmpPubSend video Config fail\n");
                         return ret;
                 }
                 _pRtmp->m_nIsVideoConfigSent = 1;
