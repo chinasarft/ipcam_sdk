@@ -49,9 +49,12 @@ int checkCmdArgAndInitStream() {
                 return 0;
         }
         
-        cmdArg.stream.IsTestAACWithoutAdts = cmdArg.isTestWithAdts;
-        if(memcmp(cmdArg.stream.pAFmt, "h265", 4) == 0)
+        cmdArg.stream.IsTestAACWithoutAdts = (cmdArg.isTestWithAdts == 0 ? 1 : 0);
+        if(memcmp(cmdArg.stream.pVFmt, "h265", 4) == 0) {
                 cmdArg.stream.isH265 = 1;
+                if (strcmp(cmdArg.stream.pVFile, "./len.h264") == 0)
+                        cmdArg.stream.pVFile = "./len.h265";
+        }
         cmdArg.stream.isLoop = cmdArg.isLoop;
         cmdArg.stream.pUserContext = &cmdArg;
         
